@@ -16,34 +16,50 @@ const { chain } = streamChain;
 const { parser } = streamJsonParser;
 
 export async function downloadFile(url: string, destination: string, timeout?: number): Promise<void> {
-  const response = await fetch(url, {
-    signal: timeout ? AbortSignal.timeout(timeout) : undefined,
-  });
+  const maxAttempts = 4;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(url, {
+        signal: timeout ? AbortSignal.timeout(timeout) : undefined,
+      });
 
-  if (!response.ok) {
-    throw new Error(`failed to download file: ${response.status} ${response.statusText}`);
+      if (!response.ok) {
+        throw new Error(`failed to download file: ${response.status} ${response.statusText}`);
+      }
+
+      const contentTypeHeader = response.headers.get('content-type');
+      if (!contentTypeHeader) {
+        throw new Error(`the file content type is expected`);
+      }
+
+      // We use the content type to force the file extension to be able to easily open the file locally
+      // but also to easily guess the content-type when finally uploading the file
+      const contentTypeObject = contentType.parse(contentTypeHeader);
+
+      const fileKind = mimeData[contentTypeObject.type];
+      const possibleExtensions = fileKind.extensions || [];
+
+      assert(possibleExtensions.length > 0);
+
+      const filePathWithExtension = `${destination}${possibleExtensions[0]}`; // The extension already contains the dot
+
+      const content = await response.arrayBuffer();
+
+      await fs.mkdir(path.dirname(filePathWithExtension), { recursive: true });
+      await fs.writeFile(filePathWithExtension, new Uint8Array(content));
+      return; // success
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const isTransient = /ECONNRESET|fetch failed|terminated|ETIMEDOUT|ECONNABORTED/i.test(msg);
+      if (isTransient && attempt < maxAttempts) {
+        const delay = attempt * 3000;
+        console.warn(`    Download attempt ${attempt}/${maxAttempts} failed (${msg}); retrying in ${delay / 1000}s...`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      } else {
+        throw error;
+      }
+    }
   }
-
-  const contentTypeHeader = response.headers.get('content-type');
-  if (!contentTypeHeader) {
-    throw new Error(`the file content type is expected`);
-  }
-
-  // We use the content type to force the file extension to be able to easily open the file locally
-  // but also to easily guess the content-type when finally uploading the file
-  const contentTypeObject = contentType.parse(contentTypeHeader);
-
-  const fileKind = mimeData[contentTypeObject.type];
-  const possibleExtensions = fileKind.extensions || [];
-
-  assert(possibleExtensions.length > 0);
-
-  const filePathWithExtension = `${destination}${possibleExtensions[0]}`; // The extension already contains the dot
-
-  const content = await response.arrayBuffer();
-
-  await fs.mkdir(path.dirname(filePathWithExtension), { recursive: true });
-  await fs.writeFile(filePathWithExtension, new Uint8Array(content));
 }
 
 export async function readBigJsonFile(filePath: string): Promise<object> {

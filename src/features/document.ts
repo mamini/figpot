@@ -1,4 +1,5 @@
 import { confirm } from '@inquirer/prompts';
+import { randomUUID } from 'node:crypto';
 import fsSync from 'fs';
 import fs from 'fs/promises';
 import { glob } from 'glob';
@@ -15,7 +16,7 @@ import { toFile } from 'ts-graphviz/adapter';
 import { z } from 'zod';
 
 import { ApiError as FigmaApiError, GetFileResponse, getImageFills } from '@figpot/src/clients/figma';
-import { OpenAPI as PenpotClientSettings, postGetFileObjectThumbnails, postGetFontVariants } from '@figpot/src/clients/penpot';
+import { OpenAPI as PenpotClientSettings, postCreateFile, postGetFileObjectThumbnails, postGetFontVariants, postGetProjectFiles } from '@figpot/src/clients/penpot';
 import { PostGetFileResponse, postGetFile, postRenameFile, postUpdateFile } from '@figpot/src/clients/penpot';
 import { appCommonFilesChanges$changeWithoutUnknown } from '@figpot/src/clients/workaround';
 import {
@@ -27,6 +28,8 @@ import {
   patchDocument,
   retrieveColors,
   retrieveDocument,
+  retrieveShallowDocument,
+  fetchSinglePageContent,
   retrieveStylesNodes,
 } from '@figpot/src/features/figma';
 import { restoreMappingFromRepository, saveMappingToRepository } from '@figpot/src/features/git';
@@ -124,6 +127,7 @@ export const RetrieveOptions = z.object({
   prompting: Prompting,
   syncMappingWithGit: z.boolean(),
   useCachedFigmaData: z.boolean(),
+  perPageProject: z.string().optional(),
 });
 export type RetrieveOptionsType = z.infer<typeof RetrieveOptions>;
 
@@ -174,15 +178,29 @@ export function getTransformedFigmaTreePath(figmaDocumentId: string, penpotDocum
   return path.resolve(getPenpotDocumentPath(figmaDocumentId, penpotDocumentId), 'transformed-tree.json');
 }
 
+/** Per-page tree cache files — used in per-page mode so the full document is never loaded at once. */
+export function getFigmaDocumentPageTreePath(documentId: string, pageIndex: number) {
+  return path.resolve(getFigmaDocumentPath(documentId), `tree_page_${pageIndex}.json`);
+}
+
 export function getFigmaMediaPath(mediaId: string) {
   return path.resolve(mediasFolderPath, mediaId);
 }
+
+// Cache for the parsed tree object — populated in per-page mode so the large file is
+// streamed from disk only once; each page transform gets a structuredClone copy (fast, no disk I/O).
+const _parsedTreeCache = new Map<string, GetFileResponse>();
 
 export async function readFigmaTreeFile(documentId: string): Promise<GetFileResponse> {
   const figmaTreePath = getFigmaDocumentTreePath(documentId);
 
   if (!fsSync.existsSync(figmaTreePath)) {
     throw new Error(`make sure to run the "retrieve" command on the Figma document "${documentId}" before using any other command`);
+  }
+
+  const cached = _parsedTreeCache.get(figmaTreePath);
+  if (cached) {
+    return structuredClone(cached);
   }
 
   return (await readBigJsonFile(figmaTreePath)) as GetFileResponse; // We did not implement a zod schema, hoping they keep the structure stable enough
@@ -350,6 +368,7 @@ export async function saveMapping(figmaDocumentId: string, penpotDocumentId: str
 
 export async function retrieve(options: RetrieveOptionsType) {
   for (const document of options.documents) {
+    console.log(`[retrieve] fetching Figma data for document "${document.figmaDocument}"...`);
     // When `--use-cached-figma-data` is set and every cache artifact is present on disk, skip the three Figma calls
     // (`retrieveColors` / `retrieveDocument` / `retrieveStylesNodes`) and reuse the processed outputs. `colors.json` and
     // `typographies.json` already store the final merged shape, so the intermediate `stylesNodes` response is not needed.
@@ -365,31 +384,42 @@ export async function retrieve(options: RetrieveOptionsType) {
     // Note: other variable kinds are not retrieved because Penpot cannot manage them (so using their raw value)
     const figmaColors = useCache ? await readFigmaColorsFile(document.figmaDocument) : await retrieveColors(document.figmaDocument);
 
-    const customPenpotFontsVariants = (await postGetFontVariants({
-      requestBody: {
-        fileId: document.penpotDocument,
-      },
-    })) as unknown as any[];
+    // In per-page mode the real penpot file IDs are not yet known at retrieve() time;
+    // font variants and mapping are handled per-page inside synchronize() instead.
+    const isPerPagePlaceholder = document.penpotDocument === 'per-page-mode-placeholder';
 
-    if (options.syncMappingWithGit) {
-      await restoreMappingFromRepository(document.figmaDocument, document.penpotDocument);
+    if (!isPerPagePlaceholder) {
+      const customPenpotFontsVariants = (await postGetFontVariants({
+        requestBody: {
+          fileId: document.penpotDocument,
+        },
+      })) as unknown as any[];
+
+      if (options.syncMappingWithGit) {
+        await restoreMappingFromRepository(document.figmaDocument, document.penpotDocument);
+      }
+
+      const mapping = await restoreMapping(document.figmaDocument, document.penpotDocument, options.prompting);
+
+      for (const customPenpotFontVariant of customPenpotFontsVariants) {
+        const simulatedFigmaFontVariantId = `${customPenpotFontVariant.fontFamily}-${customPenpotFontVariant.fontStyle}-${customPenpotFontVariant.fontWeight}`;
+        const penpotFontId = customPenpotFontVariant.fontId;
+
+        registerFontId(simulatedFigmaFontVariantId, penpotFontId, mapping);
+      }
+
+      await saveMapping(document.figmaDocument, document.penpotDocument, mapping);
     }
-
-    const mapping = await restoreMapping(document.figmaDocument, document.penpotDocument, options.prompting);
-
-    for (const customPenpotFontVariant of customPenpotFontsVariants) {
-      const simulatedFigmaFontVariantId = `${customPenpotFontVariant.fontFamily}-${customPenpotFontVariant.fontStyle}-${customPenpotFontVariant.fontWeight}`;
-      const penpotFontId = customPenpotFontVariant.fontId;
-
-      registerFontId(simulatedFigmaFontVariantId, penpotFontId, mapping);
-    }
-
-    await saveMapping(document.figmaDocument, document.penpotDocument, mapping);
 
     // Save the document tree locally (or reuse the last saved one to skip the expensive Figma fetch during debugging)
     let documentTree: GetFileResponse;
     if (useCache) {
       documentTree = await readFigmaTreeFile(document.figmaDocument);
+    } else if (isPerPagePlaceholder) {
+      // Per-page mode: only fetch the shallow document (page stubs + document-level metadata).
+      // Individual page content is fetched on demand in synchronize() and saved as tree_page_N.json.
+      console.log(`[retrieve] per-page mode: fetching shallow document metadata (depth=1)...`);
+      documentTree = await retrieveShallowDocument(document.figmaDocument);
     } else {
       try {
         documentTree = await retrieveDocument(document.figmaDocument);
@@ -450,8 +480,16 @@ export async function retrieve(options: RetrieveOptionsType) {
       await fs.writeFile(getFigmaDocumentTypographiesPath(document.figmaDocument), JSON.stringify(figmaTypographies, null, 2), {
         encoding: 'utf-8',
       });
+
+      // Free the large document tree from memory before downloading images
+      // (it has been persisted to disk above and is no longer needed in this scope)
+      (documentTree as unknown as { [k: string]: unknown }).document = undefined;
+      (documentTree as unknown as { [k: string]: unknown }).components = undefined;
+      (documentTree as unknown as { [k: string]: unknown }).componentSets = undefined;
+      (documentTree as unknown as { [k: string]: unknown }).styles = undefined;
     }
 
+    console.log(`[retrieve] downloading/checking images...`);
     // Save images
     const imagesList = await getImageFills({
       fileKey: document.figmaDocument,
@@ -1790,12 +1828,179 @@ export const SynchronizeOptions = z.object({
   serverValidation: ServerValidation,
   prompting: Prompting,
   useCachedFigmaData: z.boolean(),
+  perPageProject: z.string().optional(),
 });
 export type SynchronizeOptionsType = z.infer<typeof SynchronizeOptions>;
+
+/**
+ * Finds an existing Penpot file by name in the given project, or creates a new one.
+ * Returns the Penpot file ID to use.
+ */
+export async function findOrCreatePenpotFileForPage(
+  projectId: string,
+  pageName: string,
+  figmaDocId: string
+): Promise<string> {
+  const existingFiles = await postGetProjectFiles({
+    requestBody: { projectId },
+  });
+
+  const existing = existingFiles.find((f) => f.name === pageName);
+  if (existing) {
+    console.log(`  found existing Penpot file "${pageName}" (${existing.id})`);
+    return existing.id;
+  }
+
+  const newFileId = randomUUID();
+  console.log(`  creating new Penpot file "${pageName}" (${newFileId})`);
+  await postCreateFile({
+    requestBody: {
+      id: newFileId,
+      name: pageName,
+      projectId,
+    },
+  });
+  return newFileId;
+}
 
 export async function synchronize(options: SynchronizeOptionsType) {
   // TODO: compute the entire node tree
   await retrieve(options);
+
+  if (options.perPageProject) {
+    const figmaDocId = options.documents[0].figmaDocument;
+    const treeFilePath = getFigmaDocumentTreePath(figmaDocId);
+
+    // Read the shallow tree saved by retrieve() — contains page list (id + name) plus
+    // all document-level metadata. Never the full 1GB+ content.
+    const shallowTree = await readFigmaTreeFile(figmaDocId);
+    const pages: Array<{ id: string; name: string }> = shallowTree.document.children.map(
+      (c: { id: string; name: string }) => ({ id: c.id, name: c.name })
+    );
+
+    // ── Pre-sync validation log ──────────────────────────────────────────────
+    const isExcluded = (name: string) =>
+      !!options.excludePatterns.pageNamePatterns?.some((pat) => pat.test(name));
+    const toSync = pages.filter((p) => !isExcluded(p.name));
+
+    console.log(`\n=== Sync Plan ===`);
+    console.log(`Figma document : ${figmaDocId}`);
+    console.log(`Penpot project : ${options.perPageProject}`);
+    console.log(`Use cached     : ${options.useCachedFigmaData}`);
+    console.log(`Hydrate        : ${options.hydrate}`);
+    console.log(`Pages (${pages.length} total):`);
+    for (const p of pages) {
+      console.log(`  ${isExcluded(p.name) ? '✗' : '✓'} ${p.name}${isExcluded(p.name) ? '  (excluded)' : ''}`);
+    }
+    console.log(`To sync: ${toSync.length}  |  Skipped: ${pages.length - toSync.length}`);
+    console.log(`=================\n`);
+
+    if (toSync.length === 0) {
+      console.warn('All pages are excluded — nothing to synchronize.');
+      return;
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
+    for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+      const { id: pageId, name: pageName } = pages[pageIndex];
+
+      if (isExcluded(pageName)) {
+        console.log(`\nskipping page "${pageName}" (matches exclude pattern)`);
+        continue;
+      }
+
+      console.log(`\n[${pageIndex + 1}/${pages.length}] syncing page "${pageName}"...`);
+
+      // ── Load per-page tree: from disk cache or fresh Figma fetch ──────────
+      const pageTreePath = getFigmaDocumentPageTreePath(figmaDocId, pageIndex);
+      let pageTree: GetFileResponse;
+
+      if (options.useCachedFigmaData && fsSync.existsSync(pageTreePath)) {
+        console.log(`  [retrieve] using cached page tree...`);
+        pageTree = (await readBigJsonFile(pageTreePath)) as GetFileResponse;
+      } else {
+        console.log(`  [retrieve] fetching page content from Figma (id: ${pageId})...`);
+        const result = await fetchSinglePageContent(figmaDocId, pageId);
+        if (!result) {
+          console.warn(`  Could not fetch page "${pageName}" — skipping.`);
+          continue;
+        }
+        pageTree = result;
+        // Persist for --use-cached-figma-data on future runs
+        await fs.mkdir(getFigmaDocumentPath(figmaDocId), { recursive: true });
+        await writeBigJsonFile(pageTreePath, pageTree);
+      }
+
+      // Inject into the in-memory cache so transform() reads this page's tree
+      // via readFigmaTreeFile() instead of the shallow tree.json.
+      _parsedTreeCache.set(treeFilePath, pageTree);
+      // ─────────────────────────────────────────────────────────────────────
+
+      const penpotFileId = await findOrCreatePenpotFileForPage(options.perPageProject, pageName, figmaDocId);
+
+      // Fetch custom font variants and restore/save the mapping for this penpot file
+      const customPenpotFontsVariants = (await postGetFontVariants({
+        requestBody: { fileId: penpotFileId },
+      })) as unknown as any[];
+
+      if (options.syncMappingWithGit) {
+        await restoreMappingFromRepository(figmaDocId, penpotFileId);
+      }
+
+      const pageMapping = await restoreMapping(figmaDocId, penpotFileId, options.prompting);
+
+      for (const v of customPenpotFontsVariants) {
+        registerFontId(`${v.fontFamily}-${v.fontStyle}-${v.fontWeight}`, v.fontId, pageMapping);
+      }
+
+      await saveMapping(figmaDocId, penpotFileId, pageMapping);
+
+      const pageDocuments = [{ figmaDocument: figmaDocId, penpotDocument: penpotFileId }];
+      // Exclude all other pages — they are page stubs in the per-page tree anyway
+      const otherPagePatterns = pages
+        .filter((p) => p.name !== pageName)
+        .map((p) => new RegExp(p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'));
+      const pageExcludePatterns = {
+        ...options.excludePatterns,
+        pageNamePatterns: otherPagePatterns.length > 0 ? otherPagePatterns : undefined,
+      };
+
+      const pageOptions = {
+        ...options,
+        documents: pageDocuments,
+        excludePatterns: pageExcludePatterns,
+      };
+
+      console.log(`  [transform] converting Figma tree to Penpot format...`);
+      await transform(pageOptions);
+      // Free the per-page tree from the cache immediately — next page will set its own
+      _parsedTreeCache.delete(treeFilePath);
+
+      console.log(`  [compare] fetching current Penpot state and computing diff...`);
+      await compare(pageOptions);
+      console.log(`  [set] applying changes to Penpot...`);
+      await set(pageOptions);
+      console.log(`  done.`);
+    }
+
+    if (!options.hydrate) {
+      console.warn(
+        `pages have been synchronized but some graphical enhancements can only be done from a browser. We advise you to perform a hydratation for each file or rerun without "--no-hydrate".`
+      );
+      return;
+    }
+
+    // Hydrate all pages
+    const figmaDocId2 = options.documents[0].figmaDocument;
+    const hydrateDocs = await Promise.all(
+      (await postGetProjectFiles({ requestBody: { projectId: options.perPageProject } })).map((f) => ({
+        figmaDocument: figmaDocId2,
+        penpotDocument: f.id,
+      }))
+    );
+    await hydrate({ documents: hydrateDocs, timeout: options.hydrateTimeout });
+    return;
+  }
 
   // TODO: then
   await transform(options);

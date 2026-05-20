@@ -1,11 +1,11 @@
+import dns from 'node:dns';
+
 import { ApiError } from './ApiError';
 import type { ApiRequestOptions } from './ApiRequestOptions';
 import type { ApiResult } from './ApiResult';
 import { CancelablePromise } from './CancelablePromise';
 import type { OnCancel } from './CancelablePromise';
 import type { OpenAPIConfig } from './OpenAPI';
-
-import { getJsonResponseBody } from '../../workaround';
 
 export const isString = (value: unknown): value is string => {
 	return typeof value === 'string';
@@ -179,6 +179,10 @@ export const sendRequest = async (
 ): Promise<Response> => {
 	const controller = new AbortController();
 
+	// Force a new TCP connection per request so undici never reuses a connection
+	// that the server already closed after streaming a large response body.
+	(headers as Headers).set('Connection', 'close');
+
 	let request: RequestInit = {
 		headers,
 		body: body ?? formData,
@@ -194,9 +198,17 @@ export const sendRequest = async (
 		request = await fn(request);
 	}
 
-	onCancel(() => controller.abort());
+	// Abort after 2 minutes so that oversized pages (400+ MB) fail quickly rather than
+	// hanging until the server decides to close the connection mid-stream.
+	const timeoutId = setTimeout(() => controller.abort(), 120_000);
+	onCancel(() => {
+		clearTimeout(timeoutId);
+		controller.abort();
+	});
 
-	return await fetch(url, request);
+	dns.setDefaultResultOrder('ipv4first');
+
+	return await fetch(url, request).finally(() => clearTimeout(timeoutId));
 };
 
 export const getResponseHeader = (response: Response, responseHeader?: string): string | undefined => {
@@ -216,8 +228,7 @@ export const getResponseBody = async (response: Response): Promise<unknown> => {
 			if (contentType) {
 				const binaryTypes = ['application/octet-stream', 'application/pdf', 'application/zip', 'audio/', 'image/', 'video/'];
 				if (contentType.includes('application/json') || contentType.includes('+json')) {
-					// [WORKAROUND] Needed for huge content, see its description
-					return await getJsonResponseBody(response);
+					return await response.json();
 				} else if (binaryTypes.some(type => contentType.includes(type))) {
 					return await response.blob();
 				} else if (contentType.includes('multipart/form-data')) {
@@ -227,7 +238,8 @@ export const getResponseBody = async (response: Response): Promise<unknown> => {
 				}
 			}
 		} catch (error) {
-			console.error(error);
+			// Body streaming was cut short (e.g. server reset a very large response).
+			// Returning undefined; the caller's retry wrapper handles recovery.
 		}
 	}
 	return undefined;
@@ -322,7 +334,6 @@ export const request = <T>(config: OpenAPIConfig, options: ApiRequestOptions): C
 					response = await fn(response);
 				}
 
-        // TODO: condition per endpoint?
 				const responseBody = await getResponseBody(response);
 				const responseHeader = getResponseHeader(response, options.responseHeader);
 

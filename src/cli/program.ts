@@ -69,6 +69,11 @@ const replaceFontPatternsOption = new Option(
   `regexp + replacement family in the form '<regex>:<family>' — matched against the Figma fontFamily AND fontPostScriptName. Optionally append ':<weight>' and/or ':<normal|italic>' to also force the weight/style (useful when a single-weight Figma variant like 'Arial-Black' maps to a Penpot font registered at a different weight). Examples: '^Arial:Helvetica', '^Arial-Black$:Arial Black:400:normal' ${patternInfo}`
 );
 
+const perPageProjectOption = new Option(
+  '--per-page-project <penpotProjectId>',
+  'sync each Figma page into its own Penpot file inside the given Penpot project (auto-creates files named after the Figma pages)'
+);
+
 function formatReplaceFontPatterns(replaceFontPattern: string[]): object[] {
   return replaceFontPattern.map((patternSettings): object => {
     let remaining = patternSettings;
@@ -134,6 +139,7 @@ document
   .addOption(syncMappingWithGitOption)
   .addOption(serverValidationOption)
   .addOption(useCachedFigmaDataOption)
+  .addOption(perPageProjectOption)
   .addOption(continuousIntegrationOption)
   .option('-nh, --no-hydrate', 'prevent performing hydratation after the synchronization')
   .option('-ht, --hydrate-timeout <hydrateTimeout>', 'specify a maximum of duration for hydratation')
@@ -146,14 +152,13 @@ document
 
     let documents: DocumentOptionsType[];
     if (!options.document || options.document === true) {
-      throw new Error('please specify both figma and penpot documents to synchronize');
-      // TODO: disabling this for now until we implement the documents retrieval from Penpot
-      // TODO: should deal with `options.ci` value
-      // documents = (await retrieveDocumentsFromInput()).map((figmaDocument) => {
-      //   return {
-      //     figmaDocument: figmaDocument,
-      //   };
-      // });
+      throw new Error('please specify the figma document id with -d (e.g. -d figmaId or -d figmaId:penpotId)');
+    } else if (options.perPageProject) {
+      // In per-page mode the penpot IDs are resolved automatically; accept bare figma IDs
+      documents = processDocumentsParametersFromInput(options.document).map((d) => ({
+        figmaDocument: d.figmaDocument,
+        penpotDocument: d.penpotDocument || 'per-page-mode-placeholder',
+      }));
     } else {
       documents = processDocumentsParametersFromInput(options.document);
     }
@@ -175,6 +180,7 @@ document
         serverValidation: options.serverValidation,
         prompting: !options.ci,
         useCachedFigmaData: options.useCachedFigmaData || false,
+        perPageProject: options.perPageProject || undefined,
       })
     );
   });
